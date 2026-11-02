@@ -304,3 +304,66 @@ fn upward_text_with_middle_align_is_centred_in_a_merged_block() {
     assert!((bb.center().y - rect.center().y).abs() < 0.01, "{bb:?} not centred in {rect:?}");
     assert!((bb.center().x - rect.center().x).abs() < 0.01, "{bb:?} not centred in {rect:?}");
 }
+
+/// A host shell (Kirp Office) paints the sheet inside its own frame, running `logic` in the same
+/// pass as `ui` and without the desktop's document-windows layer. Every row's cell text must
+/// reach the screen, not only the rows that carry a fill.
+#[test]
+fn a_hosted_sheet_paints_cell_text_on_every_row() {
+    use egui::Shape;
+    use egui_kittest::Harness;
+    use gridcraft_engine::Session;
+
+    let mut app = crate::SheetApp::new(Session::new(), Default::default());
+    app.session.execute("file.new", serde_json::json!({"sample": "sales"})).unwrap();
+    let mut h = Harness::builder()
+        .with_size(egui::vec2(1200.0, 800.0))
+        .with_pixels_per_point(2.0)
+        .build_ui_state(
+            |ui, app: &mut crate::SheetApp| {
+                // Kirp Office's frame: its tab strip and rail take their panels from the root Ui
+                // first, the sheet draws the rest.
+                egui::Panel::top("host-tabs").show(ui, |ui| {
+                    ui.label("Kirp Office");
+                });
+                egui::Panel::left("host-rail").exact_size(168.0).show(ui, |ui| {
+                    ui.label("Planilha");
+                });
+                let ctx = ui.ctx().clone();
+                app.logic(&ctx);
+                app.ui(ui);
+            },
+            app,
+        );
+    for _ in 0..60 {
+        h.step();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    let pixels = h.render().expect("a rendered frame");
+    let ppp = 2.0_f32;
+    let mut seen = std::collections::BTreeSet::new();
+    for clipped in h.output().shapes.iter() {
+        let Shape::Text(t) = &clipped.shape else { continue };
+        let text = t.galley.job.text.as_str();
+        if !["North", "South", "East", "West"].contains(&text) {
+            continue;
+        }
+        let p = t.pos * ppp;
+        let dark = (0..70_u32)
+            .flat_map(|dx| (0..44_u32).map(move |dy| (dx, dy)))
+            .filter(|(dx, dy)| {
+                let (x, y) = (p.x as u32 + dx, p.y as u32 + dy);
+                x < pixels.width()
+                    && y < pixels.height()
+                    && {
+                        let q = pixels.get_pixel(x, y).0;
+                        q[0] < 128 && q[1] < 128 && q[2] < 128
+                    }
+            })
+            .count();
+        assert!(dark > 3, "{text} at {p:?} has {dark} dark pixels");
+        seen.insert(text.to_string());
+    }
+    let seen: Vec<&str> = seen.iter().map(String::as_str).collect();
+    assert_eq!(seen, ["East", "North", "South", "West"], "the four rows' texts are painted");
+}
